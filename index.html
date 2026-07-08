@@ -243,10 +243,10 @@
       opacity: .85; }
   .gantt .now { position:absolute; top:0; bottom:0; width:2px;
     background: rgba(245,158,11,.8); z-index:5; pointer-events:none; }
-  .gantt .now[data-first="1"]::after { content:"NOW"; position:absolute; top:-19px; left:-14px;
+  .gantt .now[data-first="1"]::after { content:attr(data-label); position:absolute; top:-19px; left:-14px;
     font-size:.65rem; color:var(--amber); background:var(--panel); padding:1px 5px;
     border:1px solid rgba(245,158,11,.4); border-radius:3px; z-index:10;
-    font-weight:600; }
+    font-weight:600; white-space:nowrap; }
   .gantt .empty { padding: 14px; color: var(--muted); text-align:center;
     grid-column: 1 / span 2; font-size: .85rem; }
 
@@ -774,9 +774,7 @@ function render() {
       : 'No events in range';
   } else {
     const mtbfHours = gaps.reduce((s,g) => s+g, 0) / gaps.length;
-    mtbfEl.textContent = mtbfHours >= 24
-      ? `${(mtbfHours/24).toFixed(1)} d`
-      : `${mtbfHours.toFixed(1)} h`;
+    mtbfEl.textContent = `${mtbfHours.toFixed(1)} h`;
     mtbfDeltaEl.textContent = `${gaps.length} inter-fault gap${gaps.length===1?'':'s'} · ${assetsWithMultipleFaults} asset${assetsWithMultipleFaults===1?'':'s'}`;
   }
 
@@ -1227,7 +1225,11 @@ function renderGantt(events) {
         // Mark the first lane across all groups so the NOW label only shows there
         if (isFirst && now >= rangeStart && now <= rangeEnd) {
           const nowLabel = lane.querySelector('.now');
-          if (nowLabel) nowLabel.dataset.first = '1';
+          if (nowLabel) {
+            nowLabel.dataset.first = '1';
+            // Show the data's "now" in the viewer's regional time/format
+            nowLabel.dataset.label = new Date(now).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+          }
           isFirst = false;
         }
         rowsWrap.appendChild(ac);
@@ -1246,7 +1248,11 @@ function renderGantt(events) {
       const [ac, lane] = buildAssetRow(asset);
       if (isFirst && now >= rangeStart && now <= rangeEnd) {
         const nowLabel = lane.querySelector('.now');
-        if (nowLabel) nowLabel.dataset.first = '1';
+        if (nowLabel) {
+          nowLabel.dataset.first = '1';
+          // Show the data's "now" in the viewer's regional time/format
+          nowLabel.dataset.label = new Date(now).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+        }
         isFirst = false;
       }
       ganttEl.appendChild(ac);
