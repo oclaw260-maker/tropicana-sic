@@ -2383,6 +2383,19 @@ function sicFleetFromCode(flCode) {
   return null;
 }
 
+// Site-wide free-text comments per asset (persists across shifts/dates).
+// Keyed by asset code so e.g. "TD0418 keep an eye on turbo" follows the machine.
+const SIC_SITE_COMMENTS_KEY = 'sic_site_comments_v1';
+
+function loadSicSiteComments() {
+  try { return JSON.parse(localStorage.getItem(SIC_SITE_COMMENTS_KEY) || '{}'); }
+  catch { return {}; }
+}
+function saveSicSiteComments(obj) {
+  try { localStorage.setItem(SIC_SITE_COMMENTS_KEY, JSON.stringify(obj)); }
+  catch (e) { console.warn('SIC comments save failed', e); }
+}
+
 function sicStatusFromEvent(e) {
   // Map an open SAP event to a SIC H-column status
   const title = (e.notification || '').toUpperCase();
@@ -2535,7 +2548,7 @@ function sicTotals(heavyRows) {
   return t;
 }
 
-function sicBuildHtml(shiftDate, shiftLabel, shiftStart, shiftEnd, heavyRows, dailyCells, totals) {
+function sicBuildHtml(shiftDate, shiftLabel, shiftStart, shiftEnd, heavyRows, dailyCells, totals, comments) {
   const shiftLabelFull = `${shiftDate} · ${shiftLabel}`;
   const shiftWindowStr = shiftStart.toISOString().slice(0,16).replace('T',' ') + ' → ' +
                          shiftEnd.toISOString().slice(0,16).replace('T',' ');
@@ -2548,6 +2561,7 @@ function sicBuildHtml(shiftDate, shiftLabel, shiftStart, shiftEnd, heavyRows, da
 
   const yCount = heavyRows.filter(r => r.yn === 'Y').length;
   const nCount = heavyRows.length - yCount;
+  const commentCount = heavyRows.filter(r => (comments[r.asset] || '').trim()).length;
 
   // Cell colour helper
   function cellBg(state) {
@@ -2560,6 +2574,7 @@ function sicBuildHtml(shiftDate, shiftLabel, shiftStart, shiftEnd, heavyRows, da
       <div><b>Shift:</b> ${shiftLabelFull}</div>
       <div><b>Window:</b> ${shiftWindowStr} (AWST)</div>
       <div><b>Heavy fleet total:</b> ${yCount} available / ${heavyRows.length} · ${nCount} unavailable</div>
+      <div><b>Site comments:</b> ${commentCount} asset${commentCount === 1 ? '' : 's'} tagged</div>
     </div>
 
     <h3 style="margin: 18px 0 8px; font-size: 1rem;">Heavy Fleet — Availability</h3>
@@ -2568,30 +2583,45 @@ function sicBuildHtml(shiftDate, shiftLabel, shiftStart, shiftEnd, heavyRows, da
         <tr style="background: var(--panel2); border-bottom: 1px solid var(--line);">
           <th style="text-align:left;  padding:6px;">Asset</th>
           <th style="text-align:left;  padding:6px;">Equipment</th>
-          <th style="text-align:center;padding:6px;">Y/N</th>
+          <th style="text-align:center;padding:6px; width:40px;">Y/N</th>
           <th style="text-align:left;  padding:6px;">Return to Work</th>
           <th style="text-align:left;  padding:6px;">Status</th>
           <th style="text-align:left;  padding:6px;">Description</th>
+          <th style="text-align:left;  padding:6px; width:240px;">Site Comments</th>
         </tr>
       </thead>
       <tbody>`;
 
   for (const cls of Object.keys(byClass).sort()) {
-    html += `<tr><td colspan="6" style="background: var(--panel2); padding:4px 8px;
+    html += `<tr><td colspan="7" style="background: var(--panel2); padding:4px 8px;
               font-weight:600; color:var(--accent); font-size:.78rem;">${cls} (${byClass[cls].length})</td></tr>`;
     for (const r of byClass[cls]) {
       const bg = r.yn === 'Y' ? SIC_COLORS.Y : (r.status === 'Waiting on Parts' ? SIC_COLORS.WAITING : SIC_COLORS.REPAIRS);
+      const cVal = (comments[r.asset] || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
       html += `
         <tr style="border-bottom: 1px solid var(--line);">
-          <td style="padding:5px 8px; font-family: monospace; font-weight:600;">${r.asset}</td>
-          <td style="padding:5px 8px;">${r.equipmentDesc}</td>
+          <td style="padding:5px 8px; font-family: monospace; font-weight:600;
+                     vertical-align: top;">${r.asset}</td>
+          <td style="padding:5px 8px; vertical-align: top;">${r.equipmentDesc}</td>
           <td style="padding:5px; text-align:center; background:${bg}; font-weight:700;
-                     color: ${r.yn === 'Y' ? '#0a3a0a' : (bg === SIC_COLORS.WAITING ? '#665500' : '#fff')};">
+                     color: ${r.yn === 'Y' ? '#0a3a0a' : (bg === SIC_COLORS.WAITING ? '#665500' : '#fff')};
+                     vertical-align: top;">
             ${r.yn}
           </td>
-          <td style="padding:5px 8px;">${r.returnDate || '—'}</td>
-          <td style="padding:5px 8px;">${r.status || '—'}</td>
-          <td style="padding:5px 8px;">${r.description || '—'}</td>
+          <td style="padding:5px 8px; vertical-align: top;">${r.returnDate || '—'}</td>
+          <td style="padding:5px 8px; vertical-align: top;">${r.status || '—'}</td>
+          <td style="padding:5px 8px; vertical-align: top;">${r.description || '—'}</td>
+          <td style="padding:3px 5px; vertical-align: top;">
+            <textarea class="sic-comment"
+              data-asset="${r.asset}"
+              rows="2"
+              placeholder="e.g. waiting on hydraulic hose, ETA Tue AM…"
+              style="width: 100%; min-height: 34px; resize: vertical;
+                     background: var(--panel2); color: var(--text);
+                     border: 1px solid var(--line); border-radius: 4px;
+                     padding: 4px 6px; font-size: .78rem;
+                     font-family: inherit; line-height: 1.35;">${cVal}</textarea>
+          </td>
         </tr>`;
     }
   }
@@ -2602,14 +2632,15 @@ function sicBuildHtml(shiftDate, shiftLabel, shiftStart, shiftEnd, heavyRows, da
         <tr style="background: var(--panel2); font-weight:600;">
           <td colspan="2" style="padding:6px 8px;">Totals</td>
           <td style="text-align:center; padding:6px;">${yCount}/${heavyRows.length}</td>
-          <td colspan="3" style="padding:6px 8px; font-size:.78rem;">
+          <td colspan="4" style="padding:6px 8px; font-size:.78rem;">
             ${Object.entries(totals).map(([k,v]) => `${k}: ${v}`).join(' · ')}
+            · ${commentCount} comment${commentCount === 1 ? '' : 's'}
           </td>
         </tr>
       </tfoot>
     </table>
 
-    <h3 style="margin: 24px 0 8px; font-size: 1rem;">Daily Services — Auto-tint (SAP only)</h3>
+    <div id="sicCommentStatus" style="margin-top: 6px; font-size:.72rem; color:var(--muted); min-height: 16px;"></div>
     <div style="font-size:.78rem; color:var(--muted); margin-bottom:8px;">
       Green/purple/cyan = daily service / PM completed (auto from SAP). Red = missed.
       Cream = no record. <b>Supervisor can still override on the Excel sheet.</b>
@@ -2650,7 +2681,7 @@ function sicBuildHtml(shiftDate, shiftLabel, shiftStart, shiftEnd, heavyRows, da
   return html;
 }
 
-function sicBuildPlainText(shiftDate, shiftLabel, shiftStart, shiftEnd, heavyRows, dailyCells, totals) {
+function sicBuildPlainText(shiftDate, shiftLabel, shiftStart, shiftEnd, heavyRows, dailyCells, totals, comments) {
   const lines = [];
   lines.push(`TROPICANA — MAINTENANCE SHIFT AVAILABILITY REPORT`);
   lines.push(`Shift: ${shiftDate} · ${shiftLabel}`);
@@ -2662,15 +2693,27 @@ function sicBuildPlainText(shiftDate, shiftLabel, shiftStart, shiftEnd, heavyRow
   for (const r of heavyRows) (byClass[r.fleetClass] = byClass[r.fleetClass] || []).push(r);
 
   lines.push('=== HEAVY FLEET ===');
-  lines.push(['ASSET', 'Y/N', 'RETURN', 'STATUS', 'DESCRIPTION'].join('  '));
+  lines.push(['ASSET', 'Y/N', 'RETURN', 'STATUS', 'DESCRIPTION', 'COMMENT'].join('  '));
   lines.push('-'.repeat(80));
   for (const cls of Object.keys(byClass).sort()) {
     lines.push(`-- ${cls} (${byClass[cls].length}) --`);
     for (const r of byClass[cls]) {
       const desc = (r.description || '').slice(0, 40);
-      lines.push([r.asset, r.yn, (r.returnDate || '-').slice(0,16), r.status || '-', desc].join('  '));
+      const cmt  = (comments[r.asset] || '').replace(/\s+/g, ' ').slice(0, 40);
+      lines.push([r.asset, r.yn, (r.returnDate || '-').slice(0,16), r.status || '-', desc, cmt || '-'].join('  '));
     }
   }
+
+  // Site comments section: list every asset with a comment, in full
+  const taggedAssets = heavyRows.filter(r => (comments[r.asset] || '').trim());
+  if (taggedAssets.length) {
+    lines.push('');
+    lines.push('=== SITE COMMENTS ===');
+    for (const r of taggedAssets) {
+      lines.push(`${r.asset}: ${comments[r.asset].trim()}`);
+    }
+  }
+
   lines.push('');
   lines.push('=== DAILY SERVICES (auto-tint) ===');
   lines.push('ASSET      DAY-12  NIGHT-12  DAY-24  NIGHT-24');
@@ -2741,13 +2784,48 @@ function initSicReport() {
     const heavyRows = sicRenderHeavyFleet(DATA.events, win.start, win.end, DATA.asset_desc);
     const dailyCells = sicRenderDailyServicesGrid(DATA.events, heavyRows, win.start, win.end);
     const totals = sicTotals(heavyRows);
-    const html = sicBuildHtml(win.date, win.label, win.start, win.end, heavyRows, dailyCells, totals);
-    const txt = sicBuildPlainText(win.date, win.label, win.start, win.end, heavyRows, dailyCells, totals);
+    const comments = loadSicSiteComments();
+    const html = sicBuildHtml(win.date, win.label, win.start, win.end, heavyRows, dailyCells, totals, comments);
+    const txt = sicBuildPlainText(win.date, win.label, win.start, win.end, heavyRows, dailyCells, totals, comments);
     content.innerHTML = html;
     const unavailable = heavyRows.filter(r => r.yn === 'N');
+    const cCount = heavyRows.filter(r => (comments[r.asset] || '').trim()).length;
     status.innerHTML = `Showing ${heavyRows.length} heavy-fleet assets · ${unavailable.length} unavailable ` +
-      `(${unavailable.map(r => r.asset).join(', ') || 'none'}) · ${Object.keys(dailyCells).length} daily-services rows auto-tinted`;
-    lastResult = { win, heavyRows, dailyCells, totals, txt };
+      `(${unavailable.map(r => r.asset).join(', ') || 'none'}) · ${Object.keys(dailyCells).length} daily-services rows auto-tinted ` +
+      `· ${cCount} site comment${cCount === 1 ? '' : 's'}`;
+    lastResult = { win, heavyRows, dailyCells, totals, txt, comments };
+
+    // Wire the Site Comments textareas (event delegation — one listener on the table)
+    content.addEventListener('input', onSicCommentInput);
+  }
+
+  // Debounced save — coalesce rapid keystrokes into one localStorage write
+  let _saveTimer = null;
+  function onSicCommentInput(e) {
+    const ta = e.target.closest('.sic-comment');
+    if (!ta) return;
+    const asset = ta.dataset.asset;
+    const current = loadSicSiteComments();
+    const val = ta.value;
+    if (val.trim()) current[asset] = val;
+    else delete current[asset];
+    saveSicSiteComments(current);
+    // Tiny visual confirmation
+    const statusEl = document.getElementById('sicCommentStatus');
+    if (statusEl) {
+      statusEl.textContent = `✓ ${asset} comment saved`;
+      clearTimeout(_saveTimer);
+      _saveTimer = setTimeout(() => { if (statusEl) statusEl.textContent = ''; }, 1500);
+    }
+    // Keep lastResult.comments fresh so export reflects current edits
+    if (lastResult) {
+      lastResult.comments = current;
+      // Rebuild the plain-text export on every keystroke (cheap, no DOM lookups)
+      lastResult.txt = sicBuildPlainText(
+        lastResult.win.date, lastResult.win.label, lastResult.win.start, lastResult.win.end,
+        lastResult.heavyRows, lastResult.dailyCells, lastResult.totals, current
+      );
+    }
   }
 
   btn.addEventListener('click', () => {
