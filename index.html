@@ -544,11 +544,21 @@
         </div>
         <button id="sicRegenerate" class="shift-tab" style="background: var(--accent);
           color: #001a17; border-color: var(--accent); font-weight:600;">↻ Regenerate from SAP</button>
-        <div style="margin-left:auto; display:flex; gap:6px;">
+        <div style="margin-left:auto; display:flex; gap:6px; align-items:flex-end;">
+          <label class="shift-tab" style="cursor:pointer; display:inline-flex; align-items:center; gap:6px;
+                 background: var(--panel2); color: var(--amber); border-color: var(--amber);" id="sicDsLabel">
+            📥 Load 24h Daily Services XLSX
+            <input id="sicDsFile" type="file" accept=".xlsx" style="display:none;" />
+          </label>
+          <button id="sicClearDs" class="shift-tab" style="display:none;">✕ Clear XLSX</button>
           <button id="sicCopyText"  class="shift-tab">📋 Copy plain text</button>
           <button id="sicDownloadHtml" class="shift-tab">⬇ Download HTML</button>
         </div>
       </div>
+
+      <div id="sicDsBanner" style="display:none; margin: 0 0 10px; padding: 8px 12px;
+        border-left: 3px solid var(--amber); background: rgba(245,158,11,.08);
+        border-radius: 4px; font-size: .78rem;"></div>
 
       <div style="font-size:.78rem; color:var(--muted); margin-bottom:10px;" id="sicStatus">…</div>
 
@@ -2396,6 +2406,300 @@ function saveSicSiteComments(obj) {
   catch (e) { console.warn('SIC comments save failed', e); }
 }
 
+// Last 24h completed daily services (from the per-shift XLSX Turbo uploads).
+// Stored in localStorage as { importedAt: ISO, fileName: str, rows: [...], unmatched: [...] }.
+const SIC_DAILY_SERVICES_KEY = 'sic_daily_services_v1';
+const SIC_DAILY_SERVICES_TTL_MS = 26 * 60 * 60 * 1000;  // 26h — older than 24h data is suspicious
+
+function loadSicDailyServices() {
+  try {
+    const raw = JSON.parse(localStorage.getItem(SIC_DAILY_SERVICES_KEY) || 'null');
+    if (!raw) return null;
+    // Auto-expire
+    if (Date.now() - new Date(raw.importedAt).getTime() > SIC_DAILY_SERVICES_TTL_MS) return null;
+    return raw;
+  } catch { return null; }
+}
+function saveSicDailyServices(obj) {
+  try { localStorage.setItem(SIC_DAILY_SERVICES_KEY, JSON.stringify(obj)); }
+  catch (e) { console.warn('SIC daily services save failed', e); }
+}
+function clearSicDailyServices() {
+  try { localStorage.removeItem(SIC_DAILY_SERVICES_KEY); } catch {}
+}
+
+// Map human machine names ("Bogger 449", "Jumbo 089", "Truck 367", "Prod Drill DR3244",
+// "Cable Bolter DR3251", "Normet 0733") → SIC asset code (LO/TD/DR/TR + 4-digit padded).
+// Looks up an exact match first, then falls back to greedy scan of the fleet catalog.
+function sicAssetFromDisplayName(name, fleetCatalog) {
+  if (!name) return null;
+  const cleaned = name.trim().toUpperCase();
+  // Pull out a token that's either "PRDXXXX" or a 3-4 digit number
+  let letters = '', digits = '';
+  for (const ch of cleaned) {
+    if (/[A-Z]/.test(ch) && !/\d/.test(ch)) letters += ch;
+    else if (/\d/.test(ch)) digits += ch;
+  }
+  if (!digits) return null;
+
+  // Build candidate prefixes from the fleet catalog that could plausibly match.
+  const prefixByKeyword = {
+    'BOGGER':       'LO',
+    'LOADER':       'LO',
+    'JUMBO':        'DR',
+    'DRILL':        'DR',
+    'PROD DRILL':   'DR',
+    'PRODUCTION DRILL': 'DR',
+    'CABLE BOLTER': 'DR',
+    'TRUCK':        'TD',
+    'DUMP':         'TD',
+    'NORMET':       'TR',
+    'CHARGE':       'TR',
+  };
+  let prefix = null;
+  for (const [kw, p] of Object.entries(prefixByKeyword)) {
+    if (letters.includes(kw.split(' ')[0]) || cleaned.includes(kw)) { prefix = p; break; }
+  }
+  // DR is shared for Jumbo, Prod Drill, Cable Bolter — keep DR by default if any drill keyword.
+  if (!prefix && cleaned.includes('DR')) prefix = 'DR';
+  if (!prefix && (cleaned.includes('TRUCK') || cleaned.includes('DUMP'))) prefix = 'TD';
+
+  const candidates = [];
+  for (const code of Object.keys(fleetCatalog)) {
+    if (prefix && !code.startsWith(prefix)) continue;
+    const num = code.replace(/^[A-Z]+/, '');
+    if (parseInt(num, 10) === parseInt(digits, 10)) candidates.push(code);
+  }
+  if (candidates.length === 1) return candidates[0];
+  // Ambiguous or unknown — return null so we can flag it
+  return null;
+}
+
+// Parse the uploaded XLSX workbook → { rows: [{asset, displayName, operator, ts, status, location, duration}],
+//                                      unmatched: [{displayName, ...original row}],
+//                                      fileName, importedAt }
+function parseSicDailyServicesXlsx(workbook, fleetCatalog) {
+  const out = { rows: [], unmatched: [], byAsset: {}, fileName: '', importedAt: new Date().toISOString() };
+  const sheets = workbook.SheetNames || (workbook.Workbook && workbook.Workbook.Sheets) || [];
+  if (!workbook.Sheets && workbook.SheetNames && workbook.SheetNames.length) {
+    // xlsx full build: iterate names
+  }
+  // The XLSX uploaded to Hermes is a SheetJS-friendly file (header row + cells).
+  // Use XLSX.readSheetByName pattern via the SheetJS lib already loaded on the page.
+  // The page already imports xlsx.full.min.js as a global `XLSX`.
+  const XLSX = window.XLSX;
+  if (!XLSX) return { rows: [], unmatched: [], byAsset: {}, fileName: '', importedAt: out.importedAt, error: 'SheetJS not loaded' };
+
+  const wb = (workbook.worksheets ? { Sheets: workbook, SheetNames: Object.keys(workbook) } : workbook);
+  const sheetName = wb.SheetNames[0];
+  const sheet = wb.Sheets[sheetName];
+  const grid = XLSX.utils.sheet_to_json(sheet, { header: 1, defval: null, raw: false });
+  if (!grid.length) return { rows: [], unmatched: [], byAsset: {}, fileName: '', importedAt: out.importedAt, error: 'empty sheet' };
+
+  const header = grid[0].map(c => (c || '').toString().trim());
+  const idx = {};
+  ['Equipment', 'Operator', 'Date', 'Time', 'Source/Location', 'Status', 'Duration'].forEach(k => {
+    const i = header.findIndex(h => h.toLowerCase() === k.toLowerCase());
+    if (i >= 0) idx[k] = i;
+  });
+  if (idx['Equipment'] == null) return { rows: [], unmatched: [], byAsset: {}, fileName: '', importedAt: out.importedAt, error: 'no Equipment column' };
+
+  // The XLSX groups by asset: rows where Equipment is filled are headers; following
+  // service rows have empty Equipment and inherit the current asset name.
+  // Year is in row 2 column A (separately from headers). The first Equipment value is just "2026".
+  let currentAssetName = null;
+  for (let r = 1; r < grid.length; r++) {
+    const row = grid[r] || [];
+    const eqRaw = (row[idx['Equipment']] || '').toString().trim();
+    const eqClean = eqRaw.replace(/^'/, '').trim();
+    if (eqClean && /^\d{4}$/.test(eqClean)) continue;  // year row
+    if (eqClean) currentAssetName = eqClean;
+    if (!currentAssetName) continue;
+
+    const operator = (row[idx['Operator']] || '').toString().trim();
+    const dt       = (row[idx['Date']] || '').toString().trim();
+    const tm       = (row[idx['Time']] || '').toString().trim();
+    const loc      = (row[idx['Source/Location']] || '').toString().trim();
+    const status   = (row[idx['Status']] || '').toString().trim();
+    const dur      = (row[idx['Duration']] || '').toString().trim();
+    if (!status && !dt && !tm) continue;  // blank row
+
+    const assetCode = sicAssetFromDisplayName(currentAssetName, fleetCatalog);
+    const ts = (dt && tm) ? `${dt.slice(0,10)}T${tm}` : (dt || '');
+    const rec = {
+      asset: assetCode,
+      displayName: currentAssetName,
+      operator, ts, location: loc, status, duration: dur,
+    };
+    if (assetCode) {
+      out.rows.push(rec);
+      (out.byAsset[assetCode] = out.byAsset[assetCode] || []).push(rec);
+    } else {
+      out.unmatched.push({ displayName: currentAssetName, operator, ts, location: loc, status, duration: dur });
+    }
+  }
+  return out;
+}
+
+// Render: for each asset type, build a table of every catalog asset of that type,
+// with a "24h" column coloured green if the XLSX recorded a service in the last 24h,
+// red otherwise. Includes the operator, time, and location for completed entries.
+function sicBuildDailyServicesTables(ds, fleetCatalog, assetDesc) {
+  if (!ds || !ds.rows.length) {
+    return { html: '', summary: { matched: 0, missed: 0, unmatched: 0, typeCounts: {} } };
+  }
+
+  // Map asset code → fleet class (same logic as sicRenderHeavyFleet).
+  const byClass = {};  // sicClass → [{asset, recs}]
+  for (const code of Object.keys(assetDesc)) {
+    const fleet = sicFleetFromCode(assetDesc[code].fl_code);
+    const cls = (fleet ? fleet.sicClass : 'OTHER');
+    const recs = ds.byAsset[code] || [];
+    (byClass[cls] = byClass[cls] || []).push({ asset: code, recs });
+  }
+  // Sort each class by asset code
+  for (const cls of Object.keys(byClass)) {
+    byClass[cls].sort((a, b) => a.asset.localeCompare(b.asset));
+  }
+
+  const matched = ds.rows.length;
+  const totalAssets = Object.keys(assetDesc).length;
+  let totalWithRecord = Object.keys(ds.byAsset).length;
+  const missed = totalAssets - totalWithRecord;  // approx (some assets may be in catalog but excluded by class)
+  const unmatched = ds.unmatched.length;
+  const typeCounts = {};
+
+  let html = `
+    <h3 style="margin: 24px 0 8px; font-size: 1rem;">Daily Services — Last 24h (imported XLSX)</h3>
+    <div style="font-size:.72rem; color:var(--muted); margin-bottom:6px;">
+      Source: <b>${(ds.fileName || 'unknown').replace(/</g,'&lt;')}</b> · imported ${new Date(ds.importedAt).toLocaleString()}<br>
+      <span style="display:inline-block; padding:0 6px; border-radius:3px; background:${SIC_COLORS.Y}; color:#0a3a0a;">GREEN</span>
+      = completed daily service recorded in last 24h &nbsp;
+      <span style="display:inline-block; padding:0 6px; border-radius:3px; background:${SIC_COLORS.N}; color:#fff;">RED</span>
+      = no service recorded &nbsp;
+      <b>${matched}</b> completed · <b>${unmatched}</b> unmatched machine${unmatched === 1 ? '' : 'es'} in XLSX
+    </div>`;
+
+  // Unmatched section first (so the supervisor sees "what wasn't in the catalog")
+  if (ds.unmatched.length) {
+    html += `
+      <details style="margin: 8px 0 14px; font-size:.78rem;">
+        <summary style="cursor:pointer; color: var(--red); font-weight:600;">
+          ⚠ ${ds.unmatched.length} XLSX row${ds.unmatched.length === 1 ? '' : 's'} didn't match a fleet catalog entry
+          (click to expand)
+        </summary>
+        <table style="width:100%; border-collapse:collapse; margin-top:6px;">
+          <thead>
+            <tr style="background:var(--panel2); border-bottom:1px solid var(--line);">
+              <th style="text-align:left;  padding:5px 8px;">XLSX Name</th>
+              <th style="text-align:left;  padding:5px 8px;">Operator</th>
+              <th style="text-align:left;  padding:5px 8px;">Time</th>
+              <th style="text-align:left;  padding:5px 8px;">Status</th>
+              <th style="text-align:left;  padding:5px 8px;">Location</th>
+            </tr>
+          </thead>
+          <tbody>
+            ${ds.unmatched.map(u => `
+              <tr style="border-bottom: 1px solid var(--line);">
+                <td style="padding:4px 8px; font-family: monospace; font-weight:600;">${u.displayName}</td>
+                <td style="padding:4px 8px;">${u.operator || '—'}</td>
+                <td style="padding:4px 8px;">${u.ts || '—'}</td>
+                <td style="padding:4px 8px;">${u.status || '—'}</td>
+                <td style="padding:4px 8px;">${u.location || '—'}</td>
+              </tr>`).join('')}
+          </tbody>
+        </table>
+        <div style="color:var(--muted); margin-top:6px; font-size:.72rem;">
+          These rows exist in the XLSX but the machine name didn't map to a code in the
+          current catalog. Verify there are no typos, or update the fleet catalog.
+        </div>
+      </details>`;
+  }
+
+  for (const cls of Object.keys(byClass).sort()) {
+    const list = byClass[cls];
+    const greenCount = list.filter(x => x.recs.length > 0).length;
+    const redCount = list.length - greenCount;
+    typeCounts[cls] = { green: greenCount, red: redCount, total: list.length };
+    html += `
+      <h4 style="margin: 12px 0 4px; font-size: .85rem; color: var(--accent);">
+        ${cls} (${list.length})
+        <span style="color: var(--muted); font-weight: 400;">
+          · ${greenCount} completed · ${redCount} no record
+        </span>
+      </h4>
+      <table style="width:100%; border-collapse: collapse; font-size: .78rem;">
+        <thead>
+          <tr style="background: var(--panel2); border-bottom: 1px solid var(--line);">
+            <th style="text-align:left;   padding:5px 8px; width:110px;">Asset</th>
+            <th style="text-align:center; padding:5px 8px; width:90px;">24h</th>
+            <th style="text-align:left;   padding:5px 8px; width:130px;">Last Time</th>
+            <th style="text-align:left;   padding:5px 8px;">Operator</th>
+            <th style="text-align:left;   padding:5px 8px;">Location</th>
+            <th style="text-align:left;   padding:5px 8px; width:120px;">Status</th>
+          </tr>
+        </thead>
+        <tbody>`;
+    for (const { asset, recs } of list) {
+      const ok = recs.length > 0;
+      const bg = ok ? SIC_COLORS.Y : SIC_COLORS.N;
+      const color = ok ? '#0a3a0a' : '#fff';
+      if (ok) {
+        // Most recent record first
+        recs.sort((a, b) => (b.ts || '').localeCompare(a.ts || ''));
+        const r = recs[0];
+        const allOps = [...new Set(recs.map(x => x.operator).filter(Boolean))].join(', ');
+        const allStats = [...new Set(recs.map(x => x.status).filter(Boolean))].join(', ');
+        html += `
+          <tr style="border-bottom: 1px solid var(--line);">
+            <td style="padding:4px 8px; font-family: monospace; font-weight:600;">${asset}</td>
+            <td style="text-align:center; padding:5px; background:${bg}; color:${color}; font-weight:700;">✓</td>
+            <td style="padding:4px 8px;">${(r.ts || '').replace('T', ' ').slice(0, 16) || '—'}</td>
+            <td style="padding:4px 8px;">${allOps || '—'}</td>
+            <td style="padding:4px 8px;">${r.location || '—'}</td>
+            <td style="padding:4px 8px;">${allStats || '—'}</td>
+          </tr>`;
+      } else {
+        html += `
+          <tr style="border-bottom: 1px solid var(--line);">
+            <td style="padding:4px 8px; font-family: monospace; font-weight:600;">${asset}</td>
+            <td style="text-align:center; padding:5px; background:${bg}; color:${color}; font-weight:700;">✗</td>
+            <td colspan="4" style="padding:4px 8px; color:var(--muted); font-style:italic;">
+              no service recorded in the last 24h
+            </td>
+          </tr>`;
+      }
+    }
+    html += `</tbody></table>`;
+  }
+
+  return {
+    html,
+    summary: { matched, missed, unmatched, typeCounts },
+  };
+}
+
+// Plain-text rendering for "Copy plain text" / Outlook paste
+function sicBuildDailyServicesPlain(ds) {
+  if (!ds || !ds.rows.length) return '';
+  const lines = [];
+  lines.push('');
+  lines.push('=== DAILY SERVICES — LAST 24H (XLSX) ===');
+  const byAsset = {};
+  for (const r of ds.rows) (byAsset[r.asset] = byAsset[r.asset] || []).push(r);
+  const assets = Object.keys(byAsset).sort();
+  for (const a of assets) {
+    const list = byAsset[a].sort((x, y) => (y.ts || '').localeCompare(x.ts || ''));
+    const top = list[0];
+    lines.push(`  ${a.padEnd(8)} ✓  ${(top.ts || '').replace('T',' ').slice(0,16)}  ${(top.operator || '-').padEnd(20)}  ${top.status || '-'}`);
+  }
+  if (ds.unmatched.length) {
+    lines.push('');
+    lines.push(`  ⚠ ${ds.unmatched.length} XLSX row(s) unmatched: ${ds.unmatched.map(u => u.displayName).join(', ')}`);
+  }
+  return lines.join('\n');
+}
+
 function sicStatusFromEvent(e) {
   // Map an open SAP event to a SIC H-column status
   const title = (e.notification || '').toUpperCase();
@@ -2548,7 +2852,7 @@ function sicTotals(heavyRows) {
   return t;
 }
 
-function sicBuildHtml(shiftDate, shiftLabel, shiftStart, shiftEnd, heavyRows, dailyCells, totals, comments) {
+function sicBuildHtml(shiftDate, shiftLabel, shiftStart, shiftEnd, heavyRows, dailyCells, totals, comments, dsTables) {
   const shiftLabelFull = `${shiftDate} · ${shiftLabel}`;
   const shiftWindowStr = shiftStart.toISOString().slice(0,16).replace('T',' ') + ' → ' +
                          shiftEnd.toISOString().slice(0,16).replace('T',' ');
@@ -2677,11 +2981,18 @@ function sicBuildHtml(shiftDate, shiftLabel, shiftStart, shiftEnd, heavyRows, da
     <div style="font-size:.78rem; color:var(--muted);">
       Not pre-fillable from SAP. Keep filling the Excel sheet manually for this section.
     </div>
+
+    ${dsTables && dsTables.html ? dsTables.html : `
+      <h3 style="margin: 24px 0 8px; font-size: 1rem; color: var(--muted);">Daily Services — Last 24h (imported XLSX)</h3>
+      <div style="font-size:.78rem; color:var(--muted); margin-bottom:8px;">
+        No 24h XLSX loaded yet. Click <b>📥 Load 24h Daily Services XLSX</b> in the toolbar above to attach one.
+        Uploaded data persists in this browser only and auto-expires after 26h.
+      </div>`}
   `;
   return html;
 }
 
-function sicBuildPlainText(shiftDate, shiftLabel, shiftStart, shiftEnd, heavyRows, dailyCells, totals, comments) {
+function sicBuildPlainText(shiftDate, shiftLabel, shiftStart, shiftEnd, heavyRows, dailyCells, totals, comments, ds) {
   const lines = [];
   lines.push(`TROPICANA — MAINTENANCE SHIFT AVAILABILITY REPORT`);
   lines.push(`Shift: ${shiftDate} · ${shiftLabel}`);
@@ -2730,6 +3041,11 @@ function sicBuildPlainText(shiftDate, shiftLabel, shiftStart, shiftEnd, heavyRow
   lines.push('');
   lines.push('=== LIGHT VEHICLES ===');
   lines.push('(Not pre-fillable from SAP — fill the Excel sheet manually.)');
+
+  // 24h daily services from XLSX (if loaded)
+  const dsTxt = sicBuildDailyServicesPlain(ds);
+  if (dsTxt) lines.push(dsTxt);
+
   lines.push('');
   lines.push('-- Generated from SAP PM export, ' + new Date().toISOString() + ' --');
   return lines.join('\n');
@@ -2785,18 +3101,30 @@ function initSicReport() {
     const dailyCells = sicRenderDailyServicesGrid(DATA.events, heavyRows, win.start, win.end);
     const totals = sicTotals(heavyRows);
     const comments = loadSicSiteComments();
-    const html = sicBuildHtml(win.date, win.label, win.start, win.end, heavyRows, dailyCells, totals, comments);
-    const txt = sicBuildPlainText(win.date, win.label, win.start, win.end, heavyRows, dailyCells, totals, comments);
+    const ds = loadSicDailyServices();
+    const dsTables = sicBuildDailyServicesTables(ds, DATA.asset_desc, DATA.asset_desc);
+    const html = sicBuildHtml(win.date, win.label, win.start, win.end, heavyRows, dailyCells, totals, comments, dsTables);
+    const txt = sicBuildPlainText(win.date, win.label, win.start, win.end, heavyRows, dailyCells, totals, comments, ds);
     content.innerHTML = html;
     const unavailable = heavyRows.filter(r => r.yn === 'N');
     const cCount = heavyRows.filter(r => (comments[r.asset] || '').trim()).length;
+    let statusExtra = '';
+    if (dsTables.summary.matched) {
+      statusExtra = ` · <b style="color:var(--amber)">${dsTables.summary.matched}</b> completed daily services (24h XLSX)` +
+        (dsTables.summary.unmatched ? ` · <b style="color:var(--red)">${dsTables.summary.unmatched}</b> unmatched machines in XLSX` : '');
+    } else {
+      statusExtra = ' · <i style="color:var(--muted)">no 24h XLSX loaded (use 📥 button above)</i>';
+    }
     status.innerHTML = `Showing ${heavyRows.length} heavy-fleet assets · ${unavailable.length} unavailable ` +
       `(${unavailable.map(r => r.asset).join(', ') || 'none'}) · ${Object.keys(dailyCells).length} daily-services rows auto-tinted ` +
-      `· ${cCount} site comment${cCount === 1 ? '' : 's'}`;
-    lastResult = { win, heavyRows, dailyCells, totals, txt, comments };
+      `· ${cCount} site comment${cCount === 1 ? '' : 's'}` + statusExtra;
+    lastResult = { win, heavyRows, dailyCells, totals, txt, comments, ds, dsTables };
 
     // Wire the Site Comments textareas (event delegation — one listener on the table)
     content.addEventListener('input', onSicCommentInput);
+
+    // Refresh the XLSX banner so the user sees what's loaded
+    refreshSicDsBanner();
   }
 
   // Debounced save — coalesce rapid keystrokes into one localStorage write
@@ -2823,7 +3151,8 @@ function initSicReport() {
       // Rebuild the plain-text export on every keystroke (cheap, no DOM lookups)
       lastResult.txt = sicBuildPlainText(
         lastResult.win.date, lastResult.win.label, lastResult.win.start, lastResult.win.end,
-        lastResult.heavyRows, lastResult.dailyCells, lastResult.totals, current
+        lastResult.heavyRows, lastResult.dailyCells, lastResult.totals, current,
+        lastResult.ds
       );
     }
   }
@@ -2845,6 +3174,61 @@ function initSicReport() {
   });
   dateIn.addEventListener('change', regenerate);
   document.getElementById('sicRegenerate').addEventListener('click', regenerate);
+
+  // ─── 24h Daily Services XLSX upload ───────────────────────────────────────
+  const dsFileInput = document.getElementById('sicDsFile');
+  const dsClearBtn  = document.getElementById('sicClearDs');
+  const dsBanner    = document.getElementById('sicDsBanner');
+
+  function refreshSicDsBanner() {
+    const ds = loadSicDailyServices();
+    if (!ds) {
+      dsBanner.style.display = 'none';
+      dsClearBtn.style.display = 'none';
+      return;
+    }
+    dsBanner.style.display = 'block';
+    dsClearBtn.style.display = 'inline-flex';
+    const ages = Math.round((Date.now() - new Date(ds.importedAt).getTime()) / 60000);
+    const ageStr = ages < 60 ? `${ages}m ago` : `${Math.round(ages/60)}h ago`;
+    dsBanner.innerHTML =
+      `<b>📊 24h XLSX loaded:</b> ${ds.fileName || 'unnamed'} — ${ds.rows.length} daily services` +
+      `, ${Object.keys(ds.byAsset).length} assets with records` +
+      (ds.unmatched.length ? `, <b style="color:var(--red)">${ds.unmatched.length} unmatched</b>` : '') +
+      ` · imported ${ageStr}`;
+  }
+
+  dsFileInput.addEventListener('change', async e => {
+    const file = e.target.files && e.target.files[0];
+    if (!file) return;
+    if (!window.XLSX) {
+      alert('SheetJS library not loaded yet. Try again in a second.');
+      return;
+    }
+    try {
+      const buf = await file.arrayBuffer();
+      const wb = XLSX.read(buf, { type: 'array', cellDates: false });
+      const ds = parseSicDailyServicesXlsx(wb, DATA.asset_desc);
+      ds.fileName = file.name;
+      saveSicDailyServices(ds);
+      regenerate();
+      // Brief confirmation
+      dsBanner.style.borderLeftColor = 'var(--green)';
+      setTimeout(() => { dsBanner.style.borderLeftColor = 'var(--amber)'; }, 1200);
+    } catch (err) {
+      console.error(err);
+      alert('Failed to parse XLSX: ' + err.message);
+    } finally {
+      // Reset the input so the same file can be picked again
+      dsFileInput.value = '';
+    }
+  });
+
+  dsClearBtn.addEventListener('click', () => {
+    if (!confirm('Clear loaded 24h XLSX and rebuild the report without it?')) return;
+    clearSicDailyServices();
+    regenerate();
+  });
 
   copy.addEventListener('click', async () => {
     if (!lastResult) return;
